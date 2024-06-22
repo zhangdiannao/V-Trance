@@ -41,15 +41,15 @@ void motor_move_left()
 Point trance_v(Mat &frame, double &k, double &b, double &distance)
 {
 
-    clock_t begin, end;
     vector<Point> brightness_max_point_array;
+    clock_t begin, end;
     begin = clock();
     // 遍历frame的每一列
-    for (int x = 0; x < frame.cols; x++)
+    for (int x = 0; x < frame.cols; x += 2)
     {
         uint8_t brightness_max = 0;
         Point point_brightness_max(0, 0);
-        for (int y = 0; y < frame.rows; y++)
+        for (int y = 0; y < frame.rows; y += 2)
         {
             uint8_t current_point_brightness = frame.at<uchar>(y, x);
             if (current_point_brightness)
@@ -64,7 +64,7 @@ Point trance_v(Mat &frame, double &k, double &b, double &distance)
         }
         brightness_max_point_array.push_back(Point(point_brightness_max.x, point_brightness_max.y));
     }
-    // end = clock();
+    end = clock();
     // printf("time use:%lf\n", (double)(end - begin) / CLOCKS_PER_SEC * 1000);
 #if 0
     for (int i = 0; i < brightness_max_point_array.size(); i++)
