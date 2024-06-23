@@ -4,6 +4,8 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include "opencv2/opencv.hpp"
 #include "MvCameraControl.h"
 #include <vector>
@@ -14,11 +16,24 @@ using namespace std;
 
 #define GUI_FLAG 0
 
+typedef struct image_data
+{
+    uint8_t *p;
+    mutex lock;
+} image_data;
+
 /*全局变量*/
 void *handle;            // 摄像头设备句柄
 int fd;                  // 套接字文件描述符
 struct sockaddr_in addr; // 服务器地址
 int STOP_FLAG = 0;       // 停止运动
+image_data image_data_buffer[5];
+uint8_t image_data_buffer_head = 0;
+uint8_t image_data_buffer_tail = 0;
+condition_variable ADD_FLAG;
+condition_variable REDUCE_FLAG;
+clock_t BEGIN, END;
+uint8_t time_flag = 0;
 /*全局变量结束*/
 
 void motor_stop()
@@ -229,81 +244,31 @@ void thread_camera_work()
         unsigned int nDataSize = stParam.nCurValue;
         while (1)
         {
-            // if (g_bExit)
-            // {
-            //     break;
-            // }
-
             res = MV_CC_GetOneFrameTimeout(handle, pData, nDataSize, &stImageInfo, 1000);
             if (res == MV_OK)
             {
-                // printf("[Camera Thread]GetOneFrame, Width[%d], Height[%d], nFrameNum[%d]\n", stImageInfo.nWidth, stImageInfo.nHeight, stImageInfo.nFrameNum);
-                //  转为Mat格式
+                // 获取到Mat数据
                 Mat frame(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC1, pData);
-
-                // threshold(frame, frame, 127, 255, THRESH_BINARY);
-
-                Vec4f line_param;
-                double k;
-                double b;
-                double distence = 0;
-                Point target = trance_v(frame, k, b, distence);
-#if GUI_FLAG
-                // 算出两个端点
-                Point p0, p1;
-                p0.x = 0;
-                p0.y = k * p0.x + b;
-                p1.x = frame.cols;
-                p1.y = k * p1.x + b;
-                // 画出拟合的直线
-                Mat frame_show = Mat::zeros(Size(frame.cols, frame.rows), CV_8UC3);
-                // 画出找到的点
-                circle(frame_show, target, 5, Scalar(0, 255, 0), -1);
-                // 显示图像
-                line(frame_show, p0, p1, Scalar(0, 0, 255), 5);
-
-                imshow("frame", frame);
-                imshow("frame_show", frame_show);
-                if (waitKey(10) == '1')
+                // 往当前尾巴位置写入数据
+                unique_lock<mutex> lk(image_data_buffer[image_data_buffer_tail].lock);
+                // 判断还能不能写入
+                while ((image_data_buffer_tail + 1) % 5 == image_data_buffer_head)
                 {
-                    imwrite("frame.jpg", frame);
+                    printf("[Warning]缓冲区已满,无法写入!\n");
+                    REDUCE_FLAG.notify_all();
+                    ADD_FLAG.wait(lk);
                 }
-#endif
-                int x = target.x - frame.cols / 2;
-                int state = 0;
-                // 通过目标点到直线的距离判断是否有焊缝
-                if (0)
+                printf("向%d位置写入图像...\n", image_data_buffer_tail);
+                for (int x = 0; x < 720; x++)
                 {
-                    continue;
+                    for (int y = 0; y < 1080; y++)
+                    {
+                        image_data_buffer[image_data_buffer_tail].p[x * 1080 + y] = frame.at<uchar>(y, x);
+                    }
                 }
-                if (distence <= 100)
-                {
-                    motor_stop();
-                    continue;
-                }
-                // 通过摄像头控制步进电机
-                if (STOP_FLAG)
-                {
-                    motor_stop();
-                    continue;
-                }
-                int Range = 50;
-                if (x < -Range)
-                {
-                    motor_move_left();
-                    state = -1;
-                }
-                else if (x >= -Range && x < Range)
-                {
-                    motor_stop();
-                    state = 0;
-                }
-                else if (x > Range)
-                {
-                    motor_move_right();
-                    state = 1;
-                }
-                printf("[Camera Thread]distence:%f,x=%d,state:%d\n", distence, x, state);
+                image_data_buffer_tail += 1;
+                image_data_buffer_tail %= 5;
+                lk.unlock();
             }
             else
             {
@@ -390,14 +355,76 @@ void thread_socket_work()
     }
 }
 
+void image_handler()
+{
+    while (1)
+    {
+        // 从头部取出数据
+        unique_lock<mutex> lk(image_data_buffer[image_data_buffer_head].lock);
+        // 判断还能不能取出
+        while (image_data_buffer_head == image_data_buffer_tail)
+        {
+            // printf("[Warning]缓冲区为空!\n");
+            ADD_FLAG.notify_all();
+            REDUCE_FLAG.wait(lk);
+        }
+        printf("处理%d位置的图像...\n", image_data_buffer_head);
+        uint16_t point_array[720][2];
+        for (int x = 0; x < 720; x++)
+        {
+            uint8_t brightness_max = 0;
+            uint16_t point_brightnexx_max_x = 0;
+            uint16_t point_brightnexx_max_y = 0;
+            for (int y = 0; y < 1080; y++)
+            {
+                if (image_data_buffer[image_data_buffer_head].p[x * 1080 + y] > brightness_max)
+                {
+                    brightness_max = image_data_buffer[image_data_buffer_head].p[x * 1080 + y];
+                    point_brightnexx_max_x = x;
+                    point_brightnexx_max_y = y;
+                }
+                point_array[x][0] = point_brightnexx_max_x;
+                point_array[x][1] = point_brightnexx_max_y;
+            }
+        }
+        if (time_flag == 0)
+        {
+            time_flag = 1;
+            BEGIN = clock();
+        }
+        else if (time_flag == 1)
+        {
+            time_flag = 0;
+            END = clock();
+            printf("Time used:%.1lf\n", (double)(END - BEGIN) / CLOCKS_PER_SEC * 1000);
+        }
+        image_data_buffer_head += 1;
+        image_data_buffer_head %= 5;
+        lk.unlock();
+    }
+}
+
 int main()
 {
+    // 初始化缓冲区
+    for (int i = 0; i < 5; i++)
+    {
+        image_data_buffer[i].p = (uint8_t *)malloc(777600);
+        if (image_data_buffer[i].p == NULL)
+        {
+            printf("[Error]Malloc failed!\n");
+            return 1;
+        }
+    }
+    printf("[Success]Malloc ok!\n");
     // 创建线程
     thread thread_camera(thread_camera_work);
     thread thread_socket(thread_socket_work);
+    thread thread_reduce(image_handler);
     // 线程分离
     thread_camera.detach();
     thread_socket.detach();
+    thread_reduce.detach();
     // 用户控制
     while (1)
     {

@@ -3,6 +3,8 @@
         "thread": "cpp",
         "vector": "cpp",
         "xutility": "cpp",
-        "algorithm": "cpp"
+        "algorithm": "cpp",
+        "mutex": "cpp",
+        "initializer_list": "cpp"
     }
 }
